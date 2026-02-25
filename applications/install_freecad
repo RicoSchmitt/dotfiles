@@ -1,0 +1,148 @@
+# install freecad from binary and add link on desktop
+# the reason for this setup is that the debian 12 apt repo does not support freecad 1* natively (at least not on 26.02.25) 
+
+# ~/.local/bin/freecad-appimage-install
+# Idempotent installer/updater for FreeCAD AppImage (ARM64/x86_64), desktop entry + icon.
+# Usage:
+#   freecad-appimage-install
+#   FREECAD_VERSION=1.0.2 freecad-appimage-install
+#   freecad-appimage-install --no-desktop          
+
+set -euo pipefail
+
+APP_NAME="FreeCAD"
+GH_REPO="FreeCAD/FreeCAD"
+INSTALL_DIR="${HOME}/Applications/FreeCAD"
+APP_SYMLINK="${INSTALL_DIR}/freecad-current"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+ICON_DIR="${HOME}/.local/share/icons"
+DESKTOP_FILE="${DESKTOP_DIR}/freecad.desktop"
+ICON_FILE="${ICON_DIR}/freecad.png"
+
+NO_DESKTOP=0
+if [[ "${1:-}" == "--no-desktop" ]]; then
+  NO_DESKTOP=1
+fi
+
+# ---- arch detection ----
+arch="$(uname -m)"
+case "$arch" in
+  aarch64|arm64) app_arch="aarch64" ;;
+  x86_64|amd64)  app_arch="x86_64" ;;
+  *)
+    echo "Unsupported architecture: ${arch}" >&2
+    exit 1
+    ;;
+esac
+
+# ---- version resolution ----
+# If FREECAD_VERSION is set
+FREECAD_VERSION="${FREECAD_VERSION:-}"
+if [[ -z "$FREECAD_VERSION" ]]; then
+  # GitHub API: latest stable release tag_name (e.g. "1.0.2")
+  FREECAD_VERSION="$(
+    curl -fsSL "https://api.github.com/repos/${GH_REPO}/releases/latest" \
+      | grep -Eo '"tag_name"\s*:\s*"[^"]+"' \
+      | sed -E 's/.*"([^"]+)".*/\1/'
+  )"
+  if [[ -z "$FREECAD_VERSION" ]]; then
+    echo "Failed to determine latest FreeCAD version from GitHub." >&2
+    exit 1
+  fi
+fi
+
+# ---- pick artifact name ----
+# FreeCAD uses conda-based AppImages
+APPIMAGE_BASENAME="FreeCAD_${FREECAD_VERSION}-conda-Linux-${app_arch}-py311.AppImage"
+APPIMAGE_URL="https://github.com/${GH_REPO}/releases/download/${FREECAD_VERSION}/${APPIMAGE_BASENAME}"
+SHA_URL="${APPIMAGE_URL}-SHA256.txt"
+
+mkdir -p "${INSTALL_DIR}"
+
+target="${INSTALL_DIR}/${APPIMAGE_BASENAME}"
+
+# ---- download (if missing) ----
+if [[ ! -f "${target}" ]]; then
+  echo "Downloading ${APPIMAGE_BASENAME} ..."
+  curl -fL --retry 3 --retry-delay 1 -o "${target}" "${APPIMAGE_URL}"
+  chmod +x "${target}"
+else
+  echo "Already present: ${target}"
+fi
+
+# ---- verify sha256 (best-effort) ----
+# If the SHA file exists for the release, verify. If not, continue.
+tmp_sha="$(mktemp)"
+if curl -fsSL -o "${tmp_sha}" "${SHA_URL}"; then
+  expected="$(cat "${tmp_sha}" | tr -d '\r\n')"
+  actual="$(sha256sum "${target}" | awk '{print $1}')"
+  if [[ "${expected}" != "${actual}" ]]; then
+    echo "SHA256 mismatch!" >&2
+    echo "Expected: ${expected}" >&2
+    echo "Actual:   ${actual}" >&2
+    exit 1
+  fi
+  echo "SHA256 OK"
+else
+  echo "Warning: Could not fetch SHA256 file; skipping integrity verification." >&2
+fi
+rm -f "${tmp_sha}"
+
+# ---- update symlink ----
+ln -sf "${target}" "${APP_SYMLINK}"
+echo "Symlink updated: ${APP_SYMLINK} -> ${target}"
+
+# ---- desktop integration + icon ----
+if [[ "${NO_DESKTOP}" -eq 0 ]]; then
+  mkdir -p "${DESKTOP_DIR}" "${ICON_DIR}"
+
+  # Extract icon deterministically (idempotent):
+  # We extract into a temp dir to avoid leaving squashfs-root around.
+  tmp_dir="$(mktemp -d)"
+  cleanup() { rm -rf "${tmp_dir}"; }
+  trap cleanup EXIT
+
+  (cd "${tmp_dir}" && "${APP_SYMLINK}" --appimage-extract >/dev/null 2>&1 || true)
+
+  # Find best icon candidate.
+  # Prefer hicolor >= 64 if present; fallback to any org.freecad.FreeCAD.png.
+  icon_path=""
+  if [[ -d "${tmp_dir}/squashfs-root" ]]; then
+    icon_path="$(
+      find "${tmp_dir}/squashfs-root" -type f -path '*/hicolor/*/apps/*' \
+        \( -iname 'org.freecad.FreeCAD.png' -o -iname '*freecad*.png' \) \
+        | sort -V \
+        | tail -n 1
+    )" || true
+  fi
+
+  if [[ -n "${icon_path}" && -f "${icon_path}" ]]; then
+    cp -f "${icon_path}" "${ICON_FILE}"
+    echo "Icon installed: ${ICON_FILE}"
+  else
+    echo "Warning: Could not find an icon inside AppImage; desktop entry will reference AppImage directly." >&2
+    ICON_FILE="${APP_SYMLINK}"
+  fi
+
+  cat > "${DESKTOP_FILE}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${APP_NAME} ${FREECAD_VERSION}
+Exec=${APP_SYMLINK}
+Icon=${ICON_FILE}
+Terminal=false
+Categories=Graphics;Engineering;
+StartupNotify=true
+EOF
+
+  chmod +x "${DESKTOP_FILE}"
+
+  # Optional: refresh desktop database if available
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
+  fi
+
+  echo "Desktop entry installed: ${DESKTOP_FILE}"
+fi
+
+echo "Done."
